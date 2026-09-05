@@ -1,0 +1,6 @@
+{
+  "name": "Kas Kopdes",
+  "description": "Aplikasi pembukuan bendahara kas komunitas & perkumpulan desa dengan scan bukti transfer dan struk belanja.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
