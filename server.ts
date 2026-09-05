@@ -1,9 +1,9 @@
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { createClient } from '@supabase/supabase-js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,13 +15,18 @@ const PORT = 3000;
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
 
-// Ensure data folder exists
-const DATA_DIR = path.join(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'kas_kopdes_db.json');
+// ---------------------------------------------
+// Supabase client (menggantikan penyimpanan file JSON lokal)
+// ---------------------------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.warn('PERINGATAN: SUPABASE_URL / SUPABASE_ANON_KEY belum diset di Environment Variables.');
 }
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const STORE_ROW_ID = 'main';
 
 // Initial default seed data for authentic Indonesian community / village cooperative
 function getDefaultData() {
@@ -250,39 +255,52 @@ function getDefaultData() {
   };
 }
 
-function readDb() {
-  try {
-    if (!fs.existsSync(DB_FILE)) {
-      const defaultData = getDefaultData();
-      fs.writeFileSync(DB_FILE, JSON.stringify(defaultData, null, 2), 'utf-8');
-      return defaultData;
-    }
-    const raw = fs.readFileSync(DB_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    let dirty = false;
-    if (!parsed.tabunganTargets || !Array.isArray(parsed.tabunganTargets)) {
-      parsed.tabunganTargets = getDefaultData().tabunganTargets;
-      dirty = true;
-    }
-    if (!parsed.setoranTabungan || !Array.isArray(parsed.setoranTabungan)) {
-      parsed.setoranTabungan = getDefaultData().setoranTabungan;
-      dirty = true;
-    }
-    if (dirty) {
-      writeDb(parsed);
-    }
-    return parsed;
-  } catch (err) {
-    console.error('Error reading db file:', err);
-    return getDefaultData();
+// Baca seluruh data dari Supabase (menggantikan fs.readFileSync)
+async function readDb(): Promise<any> {
+  const { data: row, error } = await supabase
+    .from('kas_kopdes_store')
+    .select('data')
+    .eq('id', STORE_ROW_ID)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Error membaca data dari Supabase:', error.message);
+    throw new Error('Gagal memuat data dari database');
   }
+
+  // Kalau baris belum ada atau datanya masih kosong, isi dengan data default
+  if (!row || !row.data || Object.keys(row.data).length === 0) {
+    const defaultData = getDefaultData();
+    await writeDb(defaultData);
+    return defaultData;
+  }
+
+  const parsed = row.data;
+  let dirty = false;
+  if (!parsed.tabunganTargets || !Array.isArray(parsed.tabunganTargets)) {
+    parsed.tabunganTargets = getDefaultData().tabunganTargets;
+    dirty = true;
+  }
+  if (!parsed.setoranTabungan || !Array.isArray(parsed.setoranTabungan)) {
+    parsed.setoranTabungan = getDefaultData().setoranTabungan;
+    dirty = true;
+  }
+  if (dirty) {
+    await writeDb(parsed);
+  }
+
+  return parsed;
 }
 
-function writeDb(data: any) {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error writing db file:', err);
+// Simpan seluruh data ke Supabase (menggantikan fs.writeFileSync)
+async function writeDb(data: any): Promise<void> {
+  const { error } = await supabase
+    .from('kas_kopdes_store')
+    .upsert({ id: STORE_ROW_ID, data, updated_at: new Date().toISOString() });
+
+  if (error) {
+    console.error('Error menulis data ke Supabase:', error.message);
+    throw new Error('Gagal menyimpan data ke database');
   }
 }
 
@@ -312,591 +330,644 @@ app.get('/api/health', (req, res) => {
 });
 
 // Summary Endpoint (Balances, counts, totals)
-app.get('/api/summary', (req, res) => {
-  const db = readDb();
-  const txs = db.transactions || [];
-  const members = db.members || [];
+app.get('/api/summary', async (req, res) => {
+  try {
+    const db = await readDb();
+    const txs = db.transactions || [];
+    const members = db.members || [];
 
-  const todayStr = new Date().toISOString().split('T')[0];
-  const now = new Date();
-  const currentYear = now.getFullYear();
-  const currentMonth = now.getMonth() + 1;
+    const todayStr = new Date().toISOString().split('T')[0];
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1;
 
-  let totalMasuk = 0;
-  let totalKeluar = 0;
-  let totalMasukBulanIni = 0;
-  let totalKeluarBulanIni = 0;
-  let totalMasukHariIni = 0;
-  let totalKeluarHariIni = 0;
+    let totalMasuk = 0;
+    let totalKeluar = 0;
+    let totalMasukBulanIni = 0;
+    let totalKeluarBulanIni = 0;
+    let totalMasukHariIni = 0;
+    let totalKeluarHariIni = 0;
 
-  for (const t of txs) {
-    const nominal = Number(t.nominal) || 0;
-    const tDate = t.tanggal ? new Date(t.tanggal) : new Date(t.createdAt);
-    const isToday = t.tanggal === todayStr;
-    const isThisMonth =
-      tDate.getFullYear() === currentYear && tDate.getMonth() + 1 === currentMonth;
+    for (const t of txs) {
+      const nominal = Number(t.nominal) || 0;
+      const tDate = t.tanggal ? new Date(t.tanggal) : new Date(t.createdAt);
+      const isToday = t.tanggal === todayStr;
+      const isThisMonth =
+        tDate.getFullYear() === currentYear && tDate.getMonth() + 1 === currentMonth;
 
-    if (t.tipe === 'masuk') {
-      totalMasuk += nominal;
-      if (isToday) totalMasukHariIni += nominal;
-      if (isThisMonth) totalMasukBulanIni += nominal;
-    } else {
-      totalKeluar += nominal;
-      if (isToday) totalKeluarHariIni += nominal;
-      if (isThisMonth) totalKeluarBulanIni += nominal;
+      if (t.tipe === 'masuk') {
+        totalMasuk += nominal;
+        if (isToday) totalMasukHariIni += nominal;
+        if (isThisMonth) totalMasukBulanIni += nominal;
+      } else {
+        totalKeluar += nominal;
+        if (isToday) totalKeluarHariIni += nominal;
+        if (isThisMonth) totalKeluarBulanIni += nominal;
+      }
     }
+
+    const totalSaldo = totalMasuk - totalKeluar;
+    const activeMembers = members.filter((m: any) => m.status === 'aktif').length;
+
+    res.json({
+      totalSaldo,
+      totalMasuk,
+      totalKeluar,
+      totalMasukBulanIni,
+      totalKeluarBulanIni,
+      totalMasukHariIni,
+      totalKeluarHariIni,
+      jumlahTransaksi: txs.length,
+      jumlahAnggotaAktif: activeMembers,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  const totalSaldo = totalMasuk - totalKeluar;
-  const activeMembers = members.filter((m: any) => m.status === 'aktif').length;
-
-  res.json({
-    totalSaldo,
-    totalMasuk,
-    totalKeluar,
-    totalMasukBulanIni,
-    totalKeluarBulanIni,
-    totalMasukHariIni,
-    totalKeluarHariIni,
-    jumlahTransaksi: txs.length,
-    jumlahAnggotaAktif: activeMembers,
-  });
 });
 
 // Transactions CRUD
-app.get('/api/transactions', (req, res) => {
-  const db = readDb();
-  // Sort descending by date
-  const sorted = (db.transactions || []).sort((a: any, b: any) => {
-    return new Date(b.tanggal + 'T' + (b.waktu || '00:00')).getTime() -
-           new Date(a.tanggal + 'T' + (a.waktu || '00:00')).getTime();
-  });
-  res.json(sorted);
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const db = await readDb();
+    const sorted = (db.transactions || []).sort((a: any, b: any) => {
+      return new Date(b.tanggal + 'T' + (b.waktu || '00:00')).getTime() -
+             new Date(a.tanggal + 'T' + (a.waktu || '00:00')).getTime();
+    });
+    res.json(sorted);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/transactions', (req, res) => {
-  const db = readDb();
-  const {
-    tipe,
-    judul,
-    nominal,
-    tanggal,
-    waktu,
-    kategori,
-    anggotaId,
-    namaPihak,
-    keterangan,
-    buktiFotoUrl,
-    buktiFotoName,
-    sumberInput,
-    alokasiDana,
-    tabunganId,
-  } = req.body;
+app.post('/api/transactions', async (req, res) => {
+  try {
+    const db = await readDb();
+    const {
+      tipe,
+      judul,
+      nominal,
+      tanggal,
+      waktu,
+      kategori,
+      anggotaId,
+      namaPihak,
+      keterangan,
+      buktiFotoUrl,
+      buktiFotoName,
+      sumberInput,
+      alokasiDana,
+      tabunganId,
+    } = req.body;
 
-  if (!tipe || !nominal || nominal <= 0) {
-    return res.status(400).json({ error: 'Tipe transaksi dan nominal valid wajib diisi' });
-  }
+    if (!tipe || !nominal || nominal <= 0) {
+      return res.status(400).json({ error: 'Tipe transaksi dan nominal valid wajib diisi' });
+    }
 
-  // Check if this is a target savings deposit
-  let targetTabungan: any = null;
-  if (tipe === 'masuk' && alokasiDana === 'tabungan_target' && tabunganId) {
-    targetTabungan = (db.tabunganTargets || []).find((t: any) => t.id === tabunganId);
-  }
+    let targetTabungan: any = null;
+    if (tipe === 'masuk' && alokasiDana === 'tabungan_target' && tabunganId) {
+      targetTabungan = (db.tabunganTargets || []).find((t: any) => t.id === tabunganId);
+    }
 
-  const newTx = {
-    id: 'tx-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-    tipe: tipe === 'masuk' ? 'masuk' : 'keluar',
-    judul: judul || (targetTabungan ? `Setoran Tabungan: ${targetTabungan.tujuan}` : (tipe === 'masuk' ? 'Setoran Kas' : 'Pembelanjaan Kas')),
-    nominal: Number(nominal),
-    tanggal: tanggal || new Date().toISOString().split('T')[0],
-    waktu: waktu || new Date().toTimeString().substring(0, 5),
-    kategori: kategori || (targetTabungan ? 'Tabungan Khusus' : (tipe === 'masuk' ? 'Iuran Wajib' : 'Operasional')),
-    anggotaId: anggotaId || undefined,
-    namaPihak: namaPihak || (tipe === 'masuk' ? 'Anggota Kas' : 'Pihak Luar/Toko'),
-    keterangan: keterangan || '',
-    buktiFotoUrl: buktiFotoUrl || undefined,
-    buktiFotoName: buktiFotoName || undefined,
-    sumberInput: sumberInput || 'manual',
-    alokasiDana: (tipe === 'masuk' && alokasiDana === 'tabungan_target' && targetTabungan) ? 'tabungan_target' : 'kas_umum',
-    tabunganId: targetTabungan ? targetTabungan.id : undefined,
-    namaTabungan: targetTabungan ? targetTabungan.tujuan : undefined,
-    createdAt: new Date().toISOString(),
-  };
-
-  db.transactions = db.transactions || [];
-  db.transactions.push(newTx);
-
-  // If tabungan target deposit, also create SetoranTabungan entry
-  if (targetTabungan) {
-    const newSetoran = {
-      id: 'st-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
-      tabunganId: targetTabungan.id,
-      anggotaId: newTx.anggotaId || '',
-      namaAnggota: newTx.namaPihak || 'Anggota',
-      nominal: newTx.nominal,
-      tanggal: newTx.tanggal,
-      waktu: newTx.waktu,
-      catatan: newTx.keterangan || `Setoran Tabungan: ${targetTabungan.tujuan}`,
-      buktiFotoUrl: newTx.buktiFotoUrl,
-      transaksiKasId: newTx.id,
+    const newTx = {
+      id: 'tx-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+      tipe: tipe === 'masuk' ? 'masuk' : 'keluar',
+      judul: judul || (targetTabungan ? `Setoran Tabungan: ${targetTabungan.tujuan}` : (tipe === 'masuk' ? 'Setoran Kas' : 'Pembelanjaan Kas')),
+      nominal: Number(nominal),
+      tanggal: tanggal || new Date().toISOString().split('T')[0],
+      waktu: waktu || new Date().toTimeString().substring(0, 5),
+      kategori: kategori || (targetTabungan ? 'Tabungan Khusus' : (tipe === 'masuk' ? 'Iuran Wajib' : 'Operasional')),
+      anggotaId: anggotaId || undefined,
+      namaPihak: namaPihak || (tipe === 'masuk' ? 'Anggota Kas' : 'Pihak Luar/Toko'),
+      keterangan: keterangan || '',
+      buktiFotoUrl: buktiFotoUrl || undefined,
+      buktiFotoName: buktiFotoName || undefined,
+      sumberInput: sumberInput || 'manual',
+      alokasiDana: (tipe === 'masuk' && alokasiDana === 'tabungan_target' && targetTabungan) ? 'tabungan_target' : 'kas_umum',
+      tabunganId: targetTabungan ? targetTabungan.id : undefined,
+      namaTabungan: targetTabungan ? targetTabungan.tujuan : undefined,
       createdAt: new Date().toISOString(),
     };
-    db.setoranTabungan = db.setoranTabungan || [];
-    db.setoranTabungan.push(newSetoran);
 
-    // Auto add member to program if not already present
-    if (newTx.anggotaId) {
-      targetTabungan.anggotaIds = targetTabungan.anggotaIds || [];
-      if (!targetTabungan.anggotaIds.includes(newTx.anggotaId)) {
-        targetTabungan.anggotaIds.push(newTx.anggotaId);
+    db.transactions = db.transactions || [];
+    db.transactions.push(newTx);
+
+    if (targetTabungan) {
+      const newSetoran = {
+        id: 'st-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+        tabunganId: targetTabungan.id,
+        anggotaId: newTx.anggotaId || '',
+        namaAnggota: newTx.namaPihak || 'Anggota',
+        nominal: newTx.nominal,
+        tanggal: newTx.tanggal,
+        waktu: newTx.waktu,
+        catatan: newTx.keterangan || `Setoran Tabungan: ${targetTabungan.tujuan}`,
+        buktiFotoUrl: newTx.buktiFotoUrl,
+        transaksiKasId: newTx.id,
+        createdAt: new Date().toISOString(),
+      };
+      db.setoranTabungan = db.setoranTabungan || [];
+      db.setoranTabungan.push(newSetoran);
+
+      if (newTx.anggotaId) {
+        targetTabungan.anggotaIds = targetTabungan.anggotaIds || [];
+        if (!targetTabungan.anggotaIds.includes(newTx.anggotaId)) {
+          targetTabungan.anggotaIds.push(newTx.anggotaId);
+        }
       }
     }
-  }
 
-  // If transaction is 'masuk' and linked to a member, update member's total deposit
-  if (newTx.tipe === 'masuk' && newTx.anggotaId && db.members) {
-    const member = db.members.find((m: any) => m.id === newTx.anggotaId);
-    if (member) {
-      member.totalSetoran = (member.totalSetoran || 0) + newTx.nominal;
+    if (newTx.tipe === 'masuk' && newTx.anggotaId && db.members) {
+      const member = db.members.find((m: any) => m.id === newTx.anggotaId);
+      if (member) {
+        member.totalSetoran = (member.totalSetoran || 0) + newTx.nominal;
+      }
     }
-  }
 
-  writeDb(db);
-  res.status(201).json(newTx);
+    await writeDb(db);
+    res.status(201).json(newTx);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put('/api/transactions/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const index = (db.transactions || []).findIndex((t: any) => t.id === id);
+app.put('/api/transactions/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const index = (db.transactions || []).findIndex((t: any) => t.id === id);
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
-  }
-
-  const oldTx = db.transactions[index];
-  const updated = {
-    ...oldTx,
-    ...req.body,
-    nominal: Number(req.body.nominal ?? oldTx.nominal),
-    id: oldTx.id,
-    createdAt: oldTx.createdAt,
-  };
-
-  db.transactions[index] = updated;
-
-  // Sync with setoranTabungan if linked
-  if (db.setoranTabungan) {
-    const linkedSetoran = db.setoranTabungan.find((s: any) => s.transaksiKasId === id);
-    if (linkedSetoran) {
-      linkedSetoran.nominal = updated.nominal;
-      linkedSetoran.tanggal = updated.tanggal;
-      linkedSetoran.waktu = updated.waktu;
-      if (updated.namaPihak) linkedSetoran.namaAnggota = updated.namaPihak;
-      if (updated.anggotaId) linkedSetoran.anggotaId = updated.anggotaId;
-      if (updated.keterangan) linkedSetoran.catatan = updated.keterangan;
+    if (index === -1) {
+      return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
     }
-  }
 
-  writeDb(db);
-  res.json(updated);
+    const oldTx = db.transactions[index];
+    const updated = {
+      ...oldTx,
+      ...req.body,
+      nominal: Number(req.body.nominal ?? oldTx.nominal),
+      id: oldTx.id,
+      createdAt: oldTx.createdAt,
+    };
+
+    db.transactions[index] = updated;
+
+    if (db.setoranTabungan) {
+      const linkedSetoran = db.setoranTabungan.find((s: any) => s.transaksiKasId === id);
+      if (linkedSetoran) {
+        linkedSetoran.nominal = updated.nominal;
+        linkedSetoran.tanggal = updated.tanggal;
+        linkedSetoran.waktu = updated.waktu;
+        if (updated.namaPihak) linkedSetoran.namaAnggota = updated.namaPihak;
+        if (updated.anggotaId) linkedSetoran.anggotaId = updated.anggotaId;
+        if (updated.keterangan) linkedSetoran.catatan = updated.keterangan;
+      }
+    }
+
+    await writeDb(db);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete('/api/transactions/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const initialLen = db.transactions ? db.transactions.length : 0;
-  db.transactions = (db.transactions || []).filter((t: any) => t.id !== id);
+app.delete('/api/transactions/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const initialLen = db.transactions ? db.transactions.length : 0;
+    db.transactions = (db.transactions || []).filter((t: any) => t.id !== id);
 
-  if (db.transactions.length === initialLen) {
-    return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    if (db.transactions.length === initialLen) {
+      return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    }
+
+    if (db.setoranTabungan) {
+      db.setoranTabungan = db.setoranTabungan.filter((s: any) => s.transaksiKasId !== id);
+    }
+
+    await writeDb(db);
+    res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  // Also remove linked setoranTabungan if exists
-  if (db.setoranTabungan) {
-    db.setoranTabungan = db.setoranTabungan.filter((s: any) => s.transaksiKasId !== id);
-  }
-
-  writeDb(db);
-  res.json({ success: true, id });
 });
 
 // Members CRUD
-app.get('/api/members', (req, res) => {
-  const db = readDb();
-  // Recalculate member deposits accurately from transactions
-  const memberSetoranMap: Record<string, number> = {};
-  for (const t of db.transactions || []) {
-    if (t.tipe === 'masuk' && t.anggotaId) {
-      memberSetoranMap[t.anggotaId] = (memberSetoranMap[t.anggotaId] || 0) + (Number(t.nominal) || 0);
-    }
-  }
-
-  const members = (db.members || []).map((m: any) => ({
-    ...m,
-    totalSetoran: memberSetoranMap[m.id] ?? (m.totalSetoran || 0),
-  }));
-
-  res.json(members);
-});
-
-app.post('/api/members', (req, res) => {
-  const db = readDb();
-  const { nama, noHp, alamat, status, nomorAnggota } = req.body;
-
-  if (!nama || !nama.trim()) {
-    return res.status(400).json({ error: 'Nama anggota wajib diisi' });
-  }
-
-  const count = (db.members || []).length + 1;
-  const generatedCode = 'KOP-' + String(count).padStart(3, '0');
-
-  const newMember = {
-    id: 'mbr-' + Date.now(),
-    nomorAnggota: nomorAnggota?.trim() || generatedCode,
-    nama: nama.trim(),
-    noHp: noHp?.trim() || '',
-    alamat: alamat?.trim() || '',
-    tanggalBergabung: new Date().toISOString().split('T')[0],
-    status: status === 'nonaktif' ? 'nonaktif' : 'aktif',
-    totalSetoran: 0,
-  };
-
-  db.members = db.members || [];
-  db.members.push(newMember);
-  writeDb(db);
-  res.status(201).json(newMember);
-});
-
-app.put('/api/members/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const index = (db.members || []).findIndex((m: any) => m.id === id);
-
-  if (index === -1) {
-    return res.status(404).json({ error: 'Anggota tidak ditemukan' });
-  }
-
-  const oldMember = db.members[index];
-  const updated = {
-    ...oldMember,
-    ...req.body,
-    id: oldMember.id,
-  };
-
-  db.members[index] = updated;
-  writeDb(db);
-  res.json(updated);
-});
-
-app.delete('/api/members/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  db.members = (db.members || []).filter((m: any) => m.id !== id);
-  if (Array.isArray(db.tabunganTargets)) {
-    db.tabunganTargets.forEach((t: any) => {
-      if (Array.isArray(t.anggotaIds)) {
-        t.anggotaIds = t.anggotaIds.filter((aid: string) => aid !== id);
+app.get('/api/members', async (req, res) => {
+  try {
+    const db = await readDb();
+    const memberSetoranMap: Record<string, number> = {};
+    for (const t of db.transactions || []) {
+      if (t.tipe === 'masuk' && t.anggotaId) {
+        memberSetoranMap[t.anggotaId] = (memberSetoranMap[t.anggotaId] || 0) + (Number(t.nominal) || 0);
       }
-    });
+    }
+
+    const members = (db.members || []).map((m: any) => ({
+      ...m,
+      totalSetoran: memberSetoranMap[m.id] ?? (m.totalSetoran || 0),
+    }));
+
+    res.json(members);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-  writeDb(db);
-  res.json({ success: true, id });
+});
+
+app.post('/api/members', async (req, res) => {
+  try {
+    const db = await readDb();
+    const { nama, noHp, alamat, status, nomorAnggota } = req.body;
+
+    if (!nama || !nama.trim()) {
+      return res.status(400).json({ error: 'Nama anggota wajib diisi' });
+    }
+
+    const count = (db.members || []).length + 1;
+    const generatedCode = 'KOP-' + String(count).padStart(3, '0');
+
+    const newMember = {
+      id: 'mbr-' + Date.now(),
+      nomorAnggota: nomorAnggota?.trim() || generatedCode,
+      nama: nama.trim(),
+      noHp: noHp?.trim() || '',
+      alamat: alamat?.trim() || '',
+      tanggalBergabung: new Date().toISOString().split('T')[0],
+      status: status === 'nonaktif' ? 'nonaktif' : 'aktif',
+      totalSetoran: 0,
+    };
+
+    db.members = db.members || [];
+    db.members.push(newMember);
+    await writeDb(db);
+    res.status(201).json(newMember);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/members/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const index = (db.members || []).findIndex((m: any) => m.id === id);
+
+    if (index === -1) {
+      return res.status(404).json({ error: 'Anggota tidak ditemukan' });
+    }
+
+    const oldMember = db.members[index];
+    const updated = {
+      ...oldMember,
+      ...req.body,
+      id: oldMember.id,
+    };
+
+    db.members[index] = updated;
+    await writeDb(db);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/members/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    db.members = (db.members || []).filter((m: any) => m.id !== id);
+    if (Array.isArray(db.tabunganTargets)) {
+      db.tabunganTargets.forEach((t: any) => {
+        if (Array.isArray(t.anggotaIds)) {
+          t.anggotaIds = t.anggotaIds.filter((aid: string) => aid !== id);
+        }
+      });
+    }
+    await writeDb(db);
+    res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------
 // TABUNGAN TARGET / KHUSUS CRUD
 // ---------------------------------------------
-app.get('/api/tabungan', (req, res) => {
-  const db = readDb();
-  const tabunganList = db.tabunganTargets || [];
-  const setoranList = db.setoranTabungan || [];
-  const members = db.members || [];
+app.get('/api/tabungan', async (req, res) => {
+  try {
+    const db = await readDb();
+    const tabunganList = db.tabunganTargets || [];
+    const setoranList = db.setoranTabungan || [];
 
-  const results = tabunganList.map((tab: any) => {
-    const pesertIds = tab.anggotaIds || [];
-    const tabSetoran = setoranList.filter((s: any) => s.tabunganId === tab.id);
-    const totalTerkumpul = tabSetoran.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
+    const results = tabunganList.map((tab: any) => {
+      const pesertIds = tab.anggotaIds || [];
+      const tabSetoran = setoranList.filter((s: any) => s.tabunganId === tab.id);
+      const totalTerkumpul = tabSetoran.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
+      const targetPerOrang = Number(tab.targetPerOrang) || 0;
+      const totalTargetKeseluruhan = targetPerOrang * pesertIds.length;
+      const saldoAkhirKekurangan = Math.max(0, totalTargetKeseluruhan - totalTerkumpul);
+      const persentaseTerkumpul = totalTargetKeseluruhan > 0
+        ? Math.min(100, Math.round((totalTerkumpul / totalTargetKeseluruhan) * 100))
+        : 0;
+
+      return {
+        ...tab,
+        jumlahPeserta: pesertIds.length,
+        totalTargetKeseluruhan,
+        totalTerkumpul,
+        saldoAkhirKekurangan,
+        persentaseTerkumpul,
+        setoranCount: tabSetoran.length,
+      };
+    });
+
+    res.json(results);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/tabungan/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const tab = (db.tabunganTargets || []).find((t: any) => t.id === id);
+
+    if (!tab) {
+      return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
+    }
+
+    const setoranList = (db.setoranTabungan || []).filter((s: any) => s.tabunganId === tab.id);
+    const members = db.members || [];
     const targetPerOrang = Number(tab.targetPerOrang) || 0;
+    const pesertIds = tab.anggotaIds || [];
+
+    const pesertaProgress = pesertIds.map((mbrId: string) => {
+      const memberObj = members.find((m: any) => m.id === mbrId);
+      const memberSetoran = setoranList.filter((s: any) => s.anggotaId === mbrId);
+      const totalDisetor = memberSetoran.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
+      const saldoAkhirKekurangan = Math.max(0, targetPerOrang - totalDisetor);
+      const persentase = targetPerOrang > 0 ? Math.min(100, Math.round((totalDisetor / targetPerOrang) * 100)) : 0;
+
+      return {
+        anggotaId: mbrId,
+        nomorAnggota: memberObj?.nomorAnggota || '-',
+        nama: memberObj?.nama || 'Anggota ' + mbrId,
+        noHp: memberObj?.noHp || '',
+        targetPerOrang,
+        totalDisetor,
+        saldoAkhirKekurangan,
+        persentase,
+        isLunas: totalDisetor >= targetPerOrang,
+        setoranHistory: memberSetoran,
+      };
+    });
+
+    const totalTerkumpul = setoranList.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
     const totalTargetKeseluruhan = targetPerOrang * pesertIds.length;
     const saldoAkhirKekurangan = Math.max(0, totalTargetKeseluruhan - totalTerkumpul);
     const persentaseTerkumpul = totalTargetKeseluruhan > 0
       ? Math.min(100, Math.round((totalTerkumpul / totalTargetKeseluruhan) * 100))
       : 0;
 
-    return {
+    res.json({
       ...tab,
       jumlahPeserta: pesertIds.length,
       totalTargetKeseluruhan,
       totalTerkumpul,
       saldoAkhirKekurangan,
       persentaseTerkumpul,
-      setoranCount: tabSetoran.length,
-    };
-  });
-
-  res.json(results);
+      pesertaProgress,
+      setoranCount: setoranList.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/api/tabungan/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const tab = (db.tabunganTargets || []).find((t: any) => t.id === id);
-
-  if (!tab) {
-    return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
-  }
-
-  const setoranList = (db.setoranTabungan || []).filter((s: any) => s.tabunganId === tab.id);
-  const members = db.members || [];
-  const targetPerOrang = Number(tab.targetPerOrang) || 0;
-  const pesertIds = tab.anggotaIds || [];
-
-  const pesertaProgress = pesertIds.map((mbrId: string) => {
-    const memberObj = members.find((m: any) => m.id === mbrId);
-    const memberSetoran = setoranList.filter((s: any) => s.anggotaId === mbrId);
-    const totalDisetor = memberSetoran.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
-    const saldoAkhirKekurangan = Math.max(0, targetPerOrang - totalDisetor);
-    const persentase = targetPerOrang > 0 ? Math.min(100, Math.round((totalDisetor / targetPerOrang) * 100)) : 0;
-
-    return {
-      anggotaId: mbrId,
-      nomorAnggota: memberObj?.nomorAnggota || '-',
-      nama: memberObj?.nama || 'Anggota ' + mbrId,
-      noHp: memberObj?.noHp || '',
+app.post('/api/tabungan', async (req, res) => {
+  try {
+    const db = await readDb();
+    const {
+      tujuan,
+      deskripsi,
       targetPerOrang,
-      totalDisetor,
-      saldoAkhirKekurangan,
-      persentase,
-      isLunas: totalDisetor >= targetPerOrang,
-      setoranHistory: memberSetoran,
-    };
-  });
+      targetWaktuBulan,
+      tanggalMulai,
+      tanggalTargetSelesai,
+      minimalSetoran,
+      anggotaIds,
+    } = req.body;
 
-  const totalTerkumpul = setoranList.reduce((acc: number, s: any) => acc + (Number(s.nominal) || 0), 0);
-  const totalTargetKeseluruhan = targetPerOrang * pesertIds.length;
-  const saldoAkhirKekurangan = Math.max(0, totalTargetKeseluruhan - totalTerkumpul);
-  const persentaseTerkumpul = totalTargetKeseluruhan > 0
-    ? Math.min(100, Math.round((totalTerkumpul / totalTargetKeseluruhan) * 100))
-    : 0;
+    if (!tujuan || !tujuan.trim()) {
+      return res.status(400).json({ error: 'Tujuan tabungan wajib diisi' });
+    }
 
-  res.json({
-    ...tab,
-    jumlahPeserta: pesertIds.length,
-    totalTargetKeseluruhan,
-    totalTerkumpul,
-    saldoAkhirKekurangan,
-    persentaseTerkumpul,
-    pesertaProgress,
-    setoranCount: setoranList.length,
-  });
-});
+    const targetNominal = Number(targetPerOrang);
+    if (!targetNominal || targetNominal <= 0) {
+      return res.status(400).json({ error: 'Target setoran per orang harus lebih dari 0' });
+    }
 
-app.post('/api/tabungan', (req, res) => {
-  const db = readDb();
-  const {
-    tujuan,
-    deskripsi,
-    targetPerOrang,
-    targetWaktuBulan,
-    tanggalMulai,
-    tanggalTargetSelesai,
-    minimalSetoran,
-    anggotaIds,
-  } = req.body;
+    const targetBulan = Number(targetWaktuBulan) || 10;
+    const startDt = tanggalMulai || new Date().toISOString().split('T')[0];
 
-  if (!tujuan || !tujuan.trim()) {
-    return res.status(400).json({ error: 'Tujuan tabungan wajib diisi' });
-  }
+    let endDt = tanggalTargetSelesai;
+    if (!endDt) {
+      const d = new Date(startDt);
+      d.setMonth(d.getMonth() + targetBulan);
+      endDt = d.toISOString().split('T')[0];
+    }
 
-  const targetNominal = Number(targetPerOrang);
-  if (!targetNominal || targetNominal <= 0) {
-    return res.status(400).json({ error: 'Target setoran per orang harus lebih dari 0' });
-  }
+    let selectedAnggotaIds = Array.isArray(anggotaIds) && anggotaIds.length > 0
+      ? anggotaIds
+      : (db.members || []).filter((m: any) => m.status === 'aktif').map((m: any) => m.id);
 
-  const targetBulan = Number(targetWaktuBulan) || 10;
-  const startDt = tanggalMulai || new Date().toISOString().split('T')[0];
-
-  // Default end date: targetBulan months from start date if not provided
-  let endDt = tanggalTargetSelesai;
-  if (!endDt) {
-    const d = new Date(startDt);
-    d.setMonth(d.getMonth() + targetBulan);
-    endDt = d.toISOString().split('T')[0];
-  }
-
-  // If no members specified, default to all active members
-  let selectedAnggotaIds = Array.isArray(anggotaIds) && anggotaIds.length > 0
-    ? anggotaIds
-    : (db.members || []).filter((m: any) => m.status === 'aktif').map((m: any) => m.id);
-
-  const newTabungan = {
-    id: 'tab-' + Date.now(),
-    tujuan: tujuan.trim(),
-    deskripsi: deskripsi?.trim() || '',
-    targetPerOrang: targetNominal,
-    targetWaktuBulan: targetBulan,
-    tanggalMulai: startDt,
-    tanggalTargetSelesai: endDt,
-    minimalSetoran: Number(minimalSetoran) || 0,
-    anggotaIds: selectedAnggotaIds,
-    status: 'aktif',
-    createdAt: new Date().toISOString(),
-  };
-
-  db.tabunganTargets = db.tabunganTargets || [];
-  db.tabunganTargets.push(newTabungan);
-  writeDb(db);
-
-  res.status(201).json(newTabungan);
-});
-
-app.put('/api/tabungan/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const index = (db.tabunganTargets || []).findIndex((t: any) => t.id === id);
-
-  if (index === -1) {
-    return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
-  }
-
-  const oldTab = db.tabunganTargets[index];
-  const updated = {
-    ...oldTab,
-    ...req.body,
-    targetPerOrang: req.body.targetPerOrang ? Number(req.body.targetPerOrang) : oldTab.targetPerOrang,
-    targetWaktuBulan: req.body.targetWaktuBulan ? Number(req.body.targetWaktuBulan) : oldTab.targetWaktuBulan,
-    minimalSetoran: req.body.minimalSetoran !== undefined ? Number(req.body.minimalSetoran) : oldTab.minimalSetoran,
-    id: oldTab.id,
-    createdAt: oldTab.createdAt,
-  };
-
-  db.tabunganTargets[index] = updated;
-  writeDb(db);
-  res.json(updated);
-});
-
-app.delete('/api/tabungan/:id', (req, res) => {
-  const db = readDb();
-  const id = req.params.id;
-  const initialLen = db.tabunganTargets ? db.tabunganTargets.length : 0;
-  db.tabunganTargets = (db.tabunganTargets || []).filter((t: any) => t.id !== id);
-
-  if (db.tabunganTargets.length === initialLen) {
-    return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
-  }
-
-  // Also remove associated setoran
-  db.setoranTabungan = (db.setoranTabungan || []).filter((s: any) => s.tabunganId !== id);
-
-  writeDb(db);
-  res.json({ success: true, id });
-});
-
-// Setoran Tabungan Endpoints
-app.get('/api/tabungan/:id/setoran', (req, res) => {
-  const db = readDb();
-  const tabId = req.params.id;
-  const list = (db.setoranTabungan || [])
-    .filter((s: any) => s.tabunganId === tabId)
-    .sort((a: any, b: any) => new Date(b.tanggal + 'T' + (b.waktu || '00:00')).getTime() -
-                              new Date(a.tanggal + 'T' + (a.waktu || '00:00')).getTime());
-  res.json(list);
-});
-
-app.post('/api/tabungan/:id/setoran', (req, res) => {
-  const db = readDb();
-  const tabId = req.params.id;
-  const tab = (db.tabunganTargets || []).find((t: any) => t.id === tabId);
-
-  if (!tab) {
-    return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
-  }
-
-  const { anggotaId, nominal, tanggal, waktu, catatan, buktiFotoUrl, catatKeBukuKas } = req.body;
-
-  if (!anggotaId) {
-    return res.status(400).json({ error: 'Pilih anggota penyetor tabungan' });
-  }
-
-  const nom = Number(nominal);
-  if (!nom || nom <= 0) {
-    return res.status(400).json({ error: 'Nominal setoran tabungan harus lebih dari 0' });
-  }
-
-  const member = (db.members || []).find((m: any) => m.id === anggotaId);
-  const namaAnggota = member ? member.nama : 'Anggota';
-
-  let transaksiKasId: string | undefined = undefined;
-
-  // Optionally record to general cash transactions book as well
-  if (catatKeBukuKas) {
-    const newTx = {
-      id: 'tx-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-      tipe: 'masuk',
-      judul: 'Setoran Tabungan: ' + tab.tujuan,
-      nominal: nom,
-      tanggal: tanggal || new Date().toISOString().split('T')[0],
-      waktu: waktu || new Date().toTimeString().substring(0, 5),
-      kategori: 'Tabungan Khusus',
-      anggotaId: anggotaId,
-      namaPihak: namaAnggota,
-      keterangan: (catatan ? catatan + ' - ' : '') + 'Program Tabungan: ' + tab.tujuan,
-      buktiFotoUrl: buktiFotoUrl || undefined,
-      sumberInput: 'manual',
+    const newTabungan = {
+      id: 'tab-' + Date.now(),
+      tujuan: tujuan.trim(),
+      deskripsi: deskripsi?.trim() || '',
+      targetPerOrang: targetNominal,
+      targetWaktuBulan: targetBulan,
+      tanggalMulai: startDt,
+      tanggalTargetSelesai: endDt,
+      minimalSetoran: Number(minimalSetoran) || 0,
+      anggotaIds: selectedAnggotaIds,
+      status: 'aktif',
       createdAt: new Date().toISOString(),
     };
 
-    db.transactions = db.transactions || [];
-    db.transactions.push(newTx);
-    transaksiKasId = newTx.id;
+    db.tabunganTargets = db.tabunganTargets || [];
+    db.tabunganTargets.push(newTabungan);
+    await writeDb(db);
 
-    if (member) {
-      member.totalSetoran = (member.totalSetoran || 0) + nom;
+    res.status(201).json(newTabungan);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/tabungan/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const index = (db.tabunganTargets || []).findIndex((t: any) => t.id === id);
+
+    if (index === -1) {
+      return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
     }
+
+    const oldTab = db.tabunganTargets[index];
+    const updated = {
+      ...oldTab,
+      ...req.body,
+      targetPerOrang: req.body.targetPerOrang ? Number(req.body.targetPerOrang) : oldTab.targetPerOrang,
+      targetWaktuBulan: req.body.targetWaktuBulan ? Number(req.body.targetWaktuBulan) : oldTab.targetWaktuBulan,
+      minimalSetoran: req.body.minimalSetoran !== undefined ? Number(req.body.minimalSetoran) : oldTab.minimalSetoran,
+      id: oldTab.id,
+      createdAt: oldTab.createdAt,
+    };
+
+    db.tabunganTargets[index] = updated;
+    await writeDb(db);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  const newSetoran = {
-    id: 'st-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
-    tabunganId: tabId,
-    anggotaId,
-    namaAnggota,
-    nominal: nom,
-    tanggal: tanggal || new Date().toISOString().split('T')[0],
-    waktu: waktu || new Date().toTimeString().substring(0, 5),
-    catatan: catatan || '',
-    buktiFotoUrl: buktiFotoUrl || undefined,
-    transaksiKasId,
-    createdAt: new Date().toISOString(),
-  };
-
-  db.setoranTabungan = db.setoranTabungan || [];
-  db.setoranTabungan.push(newSetoran);
-  writeDb(db);
-
-  res.status(201).json(newSetoran);
 });
 
-app.delete('/api/tabungan/:id/setoran/:setoranId', (req, res) => {
-  const db = readDb();
-  const { id: tabId, setoranId } = req.params;
+app.delete('/api/tabungan/:id', async (req, res) => {
+  try {
+    const db = await readDb();
+    const id = req.params.id;
+    const initialLen = db.tabunganTargets ? db.tabunganTargets.length : 0;
+    db.tabunganTargets = (db.tabunganTargets || []).filter((t: any) => t.id !== id);
 
-  const targetSetoran = (db.setoranTabungan || []).find((s: any) => s.id === setoranId && s.tabunganId === tabId);
-  if (!targetSetoran) {
-    return res.status(404).json({ error: 'Data setoran tidak ditemukan' });
+    if (db.tabunganTargets.length === initialLen) {
+      return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
+    }
+
+    db.setoranTabungan = (db.setoranTabungan || []).filter((s: any) => s.tabunganId !== id);
+
+    await writeDb(db);
+    res.json({ success: true, id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  // If was linked to main cash transaction, remove it as well
-  if (targetSetoran.transaksiKasId && db.transactions) {
-    db.transactions = db.transactions.filter((t: any) => t.id !== targetSetoran.transaksiKasId);
-  }
-
-  db.setoranTabungan = (db.setoranTabungan || []).filter((s: any) => s.id !== setoranId);
-  writeDb(db);
-
-  res.json({ success: true, setoranId });
 });
 
+// Setoran Tabungan Endpoints
+app.get('/api/tabungan/:id/setoran', async (req, res) => {
+  try {
+    const db = await readDb();
+    const tabId = req.params.id;
+    const list = (db.setoranTabungan || [])
+      .filter((s: any) => s.tabunganId === tabId)
+      .sort((a: any, b: any) => new Date(b.tanggal + 'T' + (b.waktu || '00:00')).getTime() -
+                                new Date(a.tanggal + 'T' + (a.waktu || '00:00')).getTime());
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/tabungan/:id/setoran', async (req, res) => {
+  try {
+    const db = await readDb();
+    const tabId = req.params.id;
+    const tab = (db.tabunganTargets || []).find((t: any) => t.id === tabId);
+
+    if (!tab) {
+      return res.status(404).json({ error: 'Program tabungan tidak ditemukan' });
+    }
+
+    const { anggotaId, nominal, tanggal, waktu, catatan, buktiFotoUrl, catatKeBukuKas } = req.body;
+
+    if (!anggotaId) {
+      return res.status(400).json({ error: 'Pilih anggota penyetor tabungan' });
+    }
+
+    const nom = Number(nominal);
+    if (!nom || nom <= 0) {
+      return res.status(400).json({ error: 'Nominal setoran tabungan harus lebih dari 0' });
+    }
+
+    const member = (db.members || []).find((m: any) => m.id === anggotaId);
+    const namaAnggota = member ? member.nama : 'Anggota';
+
+    let transaksiKasId: string | undefined = undefined;
+
+    if (catatKeBukuKas) {
+      const newTx = {
+        id: 'tx-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+        tipe: 'masuk',
+        judul: 'Setoran Tabungan: ' + tab.tujuan,
+        nominal: nom,
+        tanggal: tanggal || new Date().toISOString().split('T')[0],
+        waktu: waktu || new Date().toTimeString().substring(0, 5),
+        kategori: 'Tabungan Khusus',
+        anggotaId: anggotaId,
+        namaPihak: namaAnggota,
+        keterangan: (catatan ? catatan + ' - ' : '') + 'Program Tabungan: ' + tab.tujuan,
+        buktiFotoUrl: buktiFotoUrl || undefined,
+        sumberInput: 'manual',
+        createdAt: new Date().toISOString(),
+      };
+
+      db.transactions = db.transactions || [];
+      db.transactions.push(newTx);
+      transaksiKasId = newTx.id;
+
+      if (member) {
+        member.totalSetoran = (member.totalSetoran || 0) + nom;
+      }
+    }
+
+    const newSetoran = {
+      id: 'st-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      tabunganId: tabId,
+      anggotaId,
+      namaAnggota,
+      nominal: nom,
+      tanggal: tanggal || new Date().toISOString().split('T')[0],
+      waktu: waktu || new Date().toTimeString().substring(0, 5),
+      catatan: catatan || '',
+      buktiFotoUrl: buktiFotoUrl || undefined,
+      transaksiKasId,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.setoranTabungan = db.setoranTabungan || [];
+    db.setoranTabungan.push(newSetoran);
+    await writeDb(db);
+
+    res.status(201).json(newSetoran);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/tabungan/:id/setoran/:setoranId', async (req, res) => {
+  try {
+    const db = await readDb();
+    const { id: tabId, setoranId } = req.params;
+
+    const targetSetoran = (db.setoranTabungan || []).find((s: any) => s.id === setoranId && s.tabunganId === tabId);
+    if (!targetSetoran) {
+      return res.status(404).json({ error: 'Data setoran tidak ditemukan' });
+    }
+
+    if (targetSetoran.transaksiKasId && db.transactions) {
+      db.transactions = db.transactions.filter((t: any) => t.id !== targetSetoran.transaksiKasId);
+    }
+
+    db.setoranTabungan = (db.setoranTabungan || []).filter((s: any) => s.id !== setoranId);
+    await writeDb(db);
+
+    res.json({ success: true, setoranId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ---------------------------------------------
 // Gemini AI Vision Endpoint: Scan Bukti Transfer / Struk Belanja
@@ -909,7 +980,6 @@ app.post('/api/scan-receipt', async (req, res) => {
       return res.status(400).json({ error: 'Gambar bukti transfer atau struk diperlukan' });
     }
 
-    // Clean base64 string if data URL prefix exists
     let cleanBase64 = imageBase64;
     let detectedMime = mimeType || 'image/jpeg';
     if (imageBase64.includes(';base64,')) {
@@ -921,7 +991,6 @@ app.post('/api/scan-receipt', async (req, res) => {
     const ai = getGeminiClient();
     const today = new Date().toISOString().split('T')[0];
 
-    // If Gemini is available, run multimodal extraction
     if (ai) {
       try {
         const systemPrompt = `Anda adalah asisten cerdas AI untuk aplikasi bendahara "Kas Kopdes" (Kas Komunitas & Perkumpulan Desa).
@@ -989,7 +1058,6 @@ EKSTRAKSI FIELD:
         const rawText = response.text || '{}';
         const parsed = JSON.parse(rawText);
 
-        // Normalize
         const result = {
           tipe: parsed.tipe === 'masuk' ? 'masuk' : 'keluar',
           nominal: Number(parsed.nominal) || 50000,
@@ -1012,7 +1080,6 @@ EKSTRAKSI FIELD:
       }
     }
 
-    // Fallback if AI key is missing or model invocation encountered temporary error
     res.json({
       success: true,
       mode: 'fallback',
