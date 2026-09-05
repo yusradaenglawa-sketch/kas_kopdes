@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { createClient } from '@supabase/supabase-js';
+import { sql } from '@vercel/postgres';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,17 +17,24 @@ app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
 
 // ---------------------------------------------
-// Supabase client (menggantikan penyimpanan file JSON lokal)
+// Database (Vercel Postgres / Neon) — menggantikan penyimpanan file JSON lokal.
+// Tidak perlu Environment Variables manual: POSTGRES_URL sudah otomatis
+// tersedia karena database ini sudah terhubung ke project Vercel.
 // ---------------------------------------------
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.warn('PERINGATAN: SUPABASE_URL / SUPABASE_ANON_KEY belum diset di Environment Variables.');
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const STORE_ROW_ID = 'main';
+
+let tableReady = false;
+async function ensureTable() {
+  if (tableReady) return;
+  await sql`
+    CREATE TABLE IF NOT EXISTS kas_kopdes_store (
+      id text PRIMARY KEY,
+      data jsonb NOT NULL,
+      updated_at timestamptz DEFAULT now()
+    )
+  `;
+  tableReady = true;
+}
 
 // Initial default seed data for authentic Indonesian community / village cooperative
 function getDefaultData() {
@@ -256,51 +263,52 @@ function getDefaultData() {
   };
 }
 
-// Baca seluruh data dari Supabase (menggantikan fs.readFileSync)
+// Baca seluruh data dari Postgres (menggantikan fs.readFileSync)
 async function readDb(): Promise<any> {
-  const { data: row, error } = await supabase
-    .from('kas_kopdes_store')
-    .select('data')
-    .eq('id', STORE_ROW_ID)
-    .maybeSingle();
+  try {
+    await ensureTable();
+    const { rows } = await sql`SELECT data FROM kas_kopdes_store WHERE id = ${STORE_ROW_ID}`;
 
-  if (error) {
-    console.error('Error membaca data dari Supabase:', error.message);
+    // Kalau baris belum ada, isi dengan data default
+    if (rows.length === 0) {
+      const defaultData = getDefaultData();
+      await writeDb(defaultData);
+      return defaultData;
+    }
+
+    const parsed = rows[0].data;
+    let dirty = false;
+    if (!parsed.tabunganTargets || !Array.isArray(parsed.tabunganTargets)) {
+      parsed.tabunganTargets = getDefaultData().tabunganTargets;
+      dirty = true;
+    }
+    if (!parsed.setoranTabungan || !Array.isArray(parsed.setoranTabungan)) {
+      parsed.setoranTabungan = getDefaultData().setoranTabungan;
+      dirty = true;
+    }
+    if (dirty) {
+      await writeDb(parsed);
+    }
+
+    return parsed;
+  } catch (err: any) {
+    console.error('Error membaca data dari Postgres:', err.message);
     throw new Error('Gagal memuat data dari database');
   }
-
-  // Kalau baris belum ada atau datanya masih kosong, isi dengan data default
-  if (!row || !row.data || Object.keys(row.data).length === 0) {
-    const defaultData = getDefaultData();
-    await writeDb(defaultData);
-    return defaultData;
-  }
-
-  const parsed = row.data;
-  let dirty = false;
-  if (!parsed.tabunganTargets || !Array.isArray(parsed.tabunganTargets)) {
-    parsed.tabunganTargets = getDefaultData().tabunganTargets;
-    dirty = true;
-  }
-  if (!parsed.setoranTabungan || !Array.isArray(parsed.setoranTabungan)) {
-    parsed.setoranTabungan = getDefaultData().setoranTabungan;
-    dirty = true;
-  }
-  if (dirty) {
-    await writeDb(parsed);
-  }
-
-  return parsed;
 }
 
-// Simpan seluruh data ke Supabase (menggantikan fs.writeFileSync)
+// Simpan seluruh data ke Postgres (menggantikan fs.writeFileSync)
 async function writeDb(data: any): Promise<void> {
-  const { error } = await supabase
-    .from('kas_kopdes_store')
-    .upsert({ id: STORE_ROW_ID, data, updated_at: new Date().toISOString() });
-
-  if (error) {
-    console.error('Error menulis data ke Supabase:', error.message);
+  try {
+    await ensureTable();
+    const json = JSON.stringify(data);
+    await sql`
+      INSERT INTO kas_kopdes_store (id, data, updated_at)
+      VALUES (${STORE_ROW_ID}, ${json}::jsonb, now())
+      ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+    `;
+  } catch (err: any) {
+    console.error('Error menulis data ke Postgres:', err.message);
     throw new Error('Gagal menyimpan data ke database');
   }
 }
