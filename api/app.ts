@@ -331,6 +331,28 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'Kas Kopdes', time: new Date().toISOString() });
 });
 
+// ---------------------------------------------
+// Endpoint IMPORT SATU KALI PAKAI — untuk memasukkan data lama dari AI Studio
+// ke database Postgres. HAPUS endpoint ini setelah selesai dipakai (demi keamanan),
+// supaya orang lain tidak bisa menimpa data lewat endpoint ini.
+// ---------------------------------------------
+const IMPORT_SECRET = 'kopdes-import-2026';
+app.post('/api/import-data', async (req, res) => {
+  try {
+    if (req.query.key !== IMPORT_SECRET) {
+      return res.status(403).json({ error: 'Kunci import salah' });
+    }
+    const incoming = req.body;
+    if (!incoming || !Array.isArray(incoming.members)) {
+      return res.status(400).json({ error: 'Format data tidak valid' });
+    }
+    await writeDb(incoming);
+    res.json({ success: true, message: 'Data berhasil diimpor ke database' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Summary Endpoint (Balances, counts, totals)
 app.get('/api/summary', async (req, res) => {
   try {
